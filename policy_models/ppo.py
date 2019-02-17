@@ -1,14 +1,16 @@
-import gym
-import numpy as np
+import time
 import os
 import pickle
+
+import gym
+import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers
 
 
 # Functionality flags
 RENDER = False
-LOAD_MODEL = False
+LOAD_MODEL = True
 SAVE_NAME = 'cartpole_ppo'
 
 
@@ -89,19 +91,18 @@ def construct_critic():
 class PPO:
     def __init__(self):
         """Construct PPO class based on global variables."""
-        self.save_actor = os.path.join(os.getcwd(), 'model_states', 'ppo', SAVE_NAME + '_actor.h5')
-        self.save_critic = os.path.join(os.getcwd(), 'model_states', 'ppo', SAVE_NAME + '_critic.h5')
-        if not LOAD_MODEL:
-            self.actor = construct_actor()
-            self.critic = construct_critic()
-        else:
-            self.actor = tf.keras.models.load_model(self.save_actor)
-            self.critc = tf.keras.models.load_model(self.save_critic)
+        self.save_actor = os.path.join(os.getcwd(), 'model_states', 'ppo', SAVE_NAME + '_actor_weights.h5')
+        self.save_critic = os.path.join(os.getcwd(), 'model_states', 'ppo', SAVE_NAME + '_critic_weights.h5')
+        self.actor = construct_actor()
+        self.critic = construct_critic()
+        if LOAD_MODEL:
+            self.actor.load_weights(self.save_actor)
+            self.critic.load_weights(self.save_critic)
 
     def save(self):
         """Save model's current state."""
-        self.actor.save(self.save_actor)
-        self.critic.save(self.save_critic)
+        self.actor.save_weights(self.save_actor)
+        self.critic.save_weights(self.save_critic)
 
     def sample_action(self, action_probs):
         """Sample an action based of the provided probabilities."""
@@ -116,11 +117,16 @@ class PPO:
     def general_advantage_estimation(self, rewards, state_values):
         """Calculate GAE value for T timesteps."""
         true_state_values = np.zeros((len(state_values),))
-        true_state_values[-1] = state_values[-1].flatten()
+        # true_state_values[-1] = state_values[-1].flatten()
         for i in reversed(range(len(rewards))):
             true_state_values[i] = rewards[i] + GAMMA * true_state_values[i + 1]
         advantages = true_state_values[:-1] - np.concatenate(state_values[:-1]).flatten()
         return true_state_values[:-1].reshape((-1, 1)), advantages.reshape((-1, 1))
+
+    def telescoping_reward(self, rewards):
+        for idx in reversed(range(len(rewards) - 1)):
+            rewards[idx] += rewards[idx + 1] * GAMMA
+        return rewards
 
     def run_episode(self):
         """Run one epsiode and collect all needed information."""
@@ -128,15 +134,17 @@ class PPO:
         prev_observation = env.reset()
         prev_observation = prev_observation.reshape((1, -1))
         observations_episode    = []
-        rewards_episode         = []
         state_values_episode    = [] 
         action_probs_episode    = []
         actions_episode         = []
+        true_state_values_episode         = []
+        temp_rewards            = []
 
-        # Run for T timesteps and collect observations_episode, rewards_episode
+        # Run for T timesteps and collect observations_episode, true_state_values_episode
         for _ in range(T_STEPS):
             if RENDER:
                 env.render()
+                time.sleep(0.005)
 
             # Sample state value and action based on previous observation
             state_value = self.critic.predict(prev_observation)
@@ -148,30 +156,35 @@ class PPO:
 
             # Append collected data
             observations_episode.append(prev_observation)
-            rewards_episode.append(reward)
+            temp_rewards.append(reward)
             state_values_episode.append(state_value)
             action_probs_episode.append(action_probs)
             actions_episode.append(action_vector)
 
             # If environment instance is over reset
             if done:
+                true_state_values_episode += self.telescoping_reward(temp_rewards)
+                temp_rewards = []
                 prev_observation = env.reset()
             else:
                 prev_observation = observation
             prev_observation = prev_observation.reshape((1, -1))
+
+        # Last processing and return
+        true_state_values_episode += self.telescoping_reward(temp_rewards)
         state_values_episode.append(self.critic.predict(prev_observation))
-        return observations_episode, rewards_episode, state_values_episode, action_probs_episode, actions_episode
+        return observations_episode, true_state_values_episode, state_values_episode, action_probs_episode, actions_episode
 
     def train(self):
         for episode in range(EPISODES):
             # Collect results for single episode
-            observations_episode, rewards_episode, state_values_episode, action_probs_episode, actions_episode = self.run_episode()
+            observations_episode, true_state_values_episode, state_values_episode, action_probs_episode, actions_episode = self.run_episode()
             observations_episode = np.vstack(observations_episode)
             action_probs_episode = np.vstack(action_probs_episode)
             actions_episode = np.vstack(actions_episode)
+            advantages_episode = np.array(true_state_values_episode).reshape((-1, 1)) - np.vstack(state_values_episode[:-1])
 
             # Update networks
-            true_state_values_episode, advantages_episode = self.general_advantage_estimation(rewards_episode, state_values_episode)
             callbacks = [tf.keras.callbacks.TensorBoard(log_dir=os.path.join(os.getcwd(), 'logs', 'ppo'))]
             self.critic.fit(observations_episode, 
                             true_state_values_episode, 
